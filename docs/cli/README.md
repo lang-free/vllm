@@ -131,8 +131,21 @@ To use benchmark commands, please install with extra dependencies using `pip ins
 Available Commands:
 
 ```bash
-vllm bench {latency, serve, throughput}
+vllm bench {forward, latency, serve, throughput}
 ```
+
+### forward
+
+Benchmark the model forward of exact batches: each case lists its requests as `[N*]Q@C[h][:D]` (query length Q on C context tokens, D draft tokens, `h` for a prefill after a prefix hit). Each forward is captured as a one-shot CUDA graph; sampling and CPU overhead aren't measured. Use `torchrun`, one process per GPU, for DP/TP/EP.
+
+```bash
+vllm bench forward \
+    --model meta-llama/Llama-3.2-1B-Instruct \
+    --case decode=32*1@4096 \
+    --case mix=2048@0,32*1@4096
+```
+
+See [vllm bench forward](./bench/forward.md) for the full reference of all available arguments.
 
 ### latency
 

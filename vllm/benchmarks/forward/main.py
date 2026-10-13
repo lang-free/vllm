@@ -1,0 +1,240 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Benchmark the model forward of exact batches as one-shot CUDA graphs.
+
+Each case is a list of requests `(query_len, context_len, num_draft_tokens)`
+per DP rank. The bench builds the batch without the scheduler, runs it through
+the real `execute_model` (input prep, attention metadata, DP sync), and times
+the target-model forward captured as a CUDA graph. Sampling, the speculator
+and CPU step overhead aren't measured.
+
+Single GPU: `vllm bench forward --model M --case decode=32*1@8192`.
+Multi-GPU: `torchrun --nproc-per-node=N -m vllm.entrypoints.cli.main bench
+forward ...`, one process per GPU.
+"""
+
+import argparse
+import json
+import os
+import socket
+from dataclasses import asdict
+from typing import Any
+
+import numpy as np
+import torch
+
+from vllm.benchmarks.forward.shapes import BenchCase, load_cases, parse_case
+from vllm.engine.arg_utils import EngineArgs
+from vllm.logger import init_logger
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+logger = init_logger(__name__)
+
+
+def add_cli_args(parser: FlexibleArgumentParser) -> None:
+    parser.add_argument(
+        "--case",
+        action="append",
+        default=[],
+        help="NAME=REQS, where REQS is a comma list of [N*]Q@C[h][:D] (query "
+        "length Q, context length C, D draft tokens, N requests; h = prefill "
+        "after a prefix hit). E.g. decode=32*1@8192, verify=16*4@4096:3, "
+        "hit=8192@32768h, mix=8192@0,32*1@8192. Repeatable.",
+    )
+    parser.add_argument("--shapes", help="JSON or YAML file with cases.")
+    parser.add_argument(
+        "--kv-init",
+        choices=["random", "zeros"],
+        default="random",
+        help="KV cache contents. Can matter for sparse attention.",
+    )
+    parser.add_argument(
+        "--routing",
+        choices=["auto", "real", "balanced"],
+        default="auto",
+        help="MoE routing. balanced: fixed routing with equal load per EP rank. "
+        "auto: balanced with dummy weights, else real.",
+    )
+    parser.add_argument("--iters", type=int, default=20, help="Replays per sample.")
+    parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--output-json", help="Write results to this file.")
+    EngineArgs.add_cli_args(parser)
+    parser.set_defaults(load_format="dummy", enable_prefix_caching=False)
+
+
+def _setup_env() -> None:
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # Each case's eager pass compiles exactly the shapes it needs.
+    os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+    if "RANK" in os.environ:
+        return  # Launched by torchrun.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    os.environ.update(
+        RANK="0",
+        LOCAL_RANK="0",
+        WORLD_SIZE="1",
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+    )
+
+
+def _register_dummy_loader() -> str:
+    """Dummy loader that also runs load-time model finalization.
+
+    TODO(woosuk): Remove once #60096 lands. DeepSeek-V4.1 fuses its MegaMoE
+    shared experts at the end of `load_weights`, before the generic linear
+    post-processing repacks their scales. Dummy loading never calls
+    `load_weights`, so the fusion would fail and the bench would time unfused
+    shared experts.
+    """
+    from vllm.model_executor.model_loader import register_model_loader
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+
+    name = "forward_bench_dummy"
+
+    @register_model_loader(name)
+    class ForwardBenchDummyLoader(DummyModelLoader):
+        def load_weights(self, model, model_config) -> None:
+            super().load_weights(model, model_config)
+            if any(hasattr(m, "finalize_mega_moe_weights") for m in model.modules()):
+                model.process_weights_after_loading()
+
+    return name
+
+
+def _make_engine_args(args: argparse.Namespace, cases: list[BenchCase]):
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+
+    engine_args = EngineArgs.from_cli_args(args)
+    if engine_args.load_format == "dummy":
+        engine_args.load_format = _register_dummy_loader()
+    engine_args.distributed_executor_backend = "external_launcher"
+    engine_args.enable_prefix_caching = False
+    engine_args.compilation_config.mode = CompilationMode.NONE
+    engine_args.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    if engine_args.max_num_seqs is None:
+        engine_args.max_num_seqs = max(len(c.requests) for c in cases)
+    if engine_args.max_num_batched_tokens is None:
+        # Prefix hits may replay up to a window more per request.
+        engine_args.max_num_batched_tokens = max(
+            8192,
+            *(
+                c.num_tokens + 1024 * sum(r.prefix_hit for r in c.requests)
+                for c in cases
+            ),
+        )
+    if engine_args.max_model_len is None:
+        engine_args.max_model_len = max(c.max_seq_len for c in cases)
+    return engine_args
+
+
+def run_case(runner, case: BenchCase, args: argparse.Namespace) -> dict[str, Any]:
+    from vllm.benchmarks.forward.batch import build_batch
+    from vllm.benchmarks.forward.capture import ForwardBench
+    from vllm.benchmarks.forward.kv_init import init_kv_blocks, touched_kv_views
+    from vllm.benchmarks.forward.routing import install_routing
+
+    context = runner.vllm_config.compilation_config.static_forward_context
+    kv_config = runner.kv_cache_config
+    rng = np.random.default_rng([args.seed, runner.dp_rank])
+    batch = build_batch(
+        case,
+        kv_config.kv_cache_groups,
+        kv_config.num_blocks,
+        runner.model_config.get_vocab_size(),
+        rng,
+    )
+    generator = torch.Generator(device=runner.device)
+    generator.manual_seed(int(rng.integers(1 << 62)))
+    init_kv_blocks(
+        context,
+        kv_config.kv_cache_groups,
+        batch,
+        kv_config.num_blocks,
+        args.kv_init,
+        generator,
+    )
+    bench = ForwardBench(
+        runner.model,
+        batch,
+        runner.device,
+        args.iters,
+        args.samples,
+        touched_kv_views(
+            context, kv_config.kv_cache_groups, batch, kv_config.num_blocks
+        ),
+    )
+    routing, balanced = install_routing(
+        runner, args.routing, args.load_format == "dummy", batch.num_tokens, args.seed
+    )
+    try:
+        with runner.override_model_forward(bench):
+            runner.execute_model(batch.scheduler_output)
+            if balanced is not None:
+                balanced.check_applied()
+            bench.phase = "capture"
+            runner.execute_model(batch.scheduler_output)
+    finally:
+        runner.execute_model(batch.finish())
+        if balanced is not None:
+            balanced.remove()
+    return {
+        "num_tokens": batch.num_tokens,
+        "kv_blocks": batch.num_blocks,
+        "routing": routing,
+        **bench.result,
+    }
+
+
+def main(args: argparse.Namespace) -> None:
+    cases = [parse_case(c) for c in args.case]
+    if args.shapes:
+        cases += load_cases(args.shapes)
+    if not cases:
+        raise ValueError("Pass at least one --case or --shapes.")
+    _setup_env()
+
+    from vllm import LLM
+    from vllm.config import set_current_vllm_config
+    from vllm.distributed.parallel_state import get_world_group
+
+    llm = LLM.from_engine_args(_make_engine_args(args, cases))
+    runner = llm.llm_engine.model_executor.driver_worker.worker.model_runner
+    world = get_world_group()
+    results = []
+    with torch.inference_mode(), set_current_vllm_config(runner.vllm_config):
+        for case in cases:
+            result = run_case(runner, case, args)
+            gathered: list[Any] = [None] * world.world_size
+            torch.distributed.all_gather_object(gathered, result, group=world.cpu_group)
+            if world.rank != 0:
+                continue
+            rank0 = gathered[0]
+            latency = rank0["latency_us"]  # Each replay is the max over ranks.
+            results.append(
+                {
+                    "case": case.name,
+                    "requests": [asdict(r) for r in case.requests],
+                    "median_us": latency["median"],
+                    "ranks": gathered,
+                }
+            )
+            print(
+                f"[forward] {case.name}: {len(case.requests)} reqs, "
+                f"{rank0['num_tokens']} tokens, median {latency['median']:.1f} us, "
+                f"sample spread {latency['sample_spread_pct']:.2f}%, graph vs "
+                f"eager rel rms {rank0['graph_vs_eager']['relative_rms']:.1e}",
+                flush=True,
+            )
+            if latency["sample_spread_pct"] > 0.5:
+                logger.warning(
+                    "%s: unstable timing (sample medians spread %.2f%%).",
+                    case.name,
+                    latency["sample_spread_pct"],
+                )
+    if world.rank == 0 and args.output_json:
+        with open(args.output_json, "w") as f:
+            json.dump(results, f, indent=2)

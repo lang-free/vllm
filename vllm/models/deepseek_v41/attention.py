@@ -566,6 +566,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             packed_page_alignment=self.kv_page_alignment,
             bounded_replay=swa_bounded_replay,
         )
+        # The SWA cache's records are written by the same insert op.
+        self.swa_cache_layer.init_kv_cache_random = self.init_kv_cache_random
 
         # The attention layer itself was already registered with the
         # compilation context above (before indexer/compressor creation).
@@ -1135,6 +1137,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.backend_cls
 
+    @torch.no_grad()
+    def init_kv_cache_random(
+        self,
+        kv_cache: torch.Tensor,
+        block_ranges: list[tuple[int, int]],
+        generator: torch.Generator,
+    ) -> None:
+        """Fill blocks of a packed KV cache with random, validly quantized KV.
+
+        For benchmarks: the compressed or sliding-window records are written by
+        the model's own insert op from random latents at position 0, where RoPE
+        is the identity. Also serves this layer's SWA cache.
+        """
+        from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
+            rope_quant_insert,
+        )
+
+        rows = kv_cache.shape[1]
+        chunk = 4096
+        for begin, end in block_ranges:
+            for start in range(begin * rows, end * rows, chunk):
+                n = min(chunk, end * rows - start)
+                latent = torch.randn(
+                    (n, self.head_dim),
+                    generator=generator,
+                    device=kv_cache.device,
+                    dtype=torch.bfloat16,
+                )
+                slots = torch.arange(start, start + n, device=kv_cache.device)
+                rope_quant_insert(
+                    latent,
+                    torch.zeros_like(slots),
+                    self.rotary_emb.cos_sin_cache,
+                    kv_cache,
+                    slots,
+                    compress_ratio=1,
+                )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
         # Only kv-source layers own a compressed-KV cache; consumers read the
         # source's cache through the forward context, and cr==0 layers are
@@ -1202,6 +1242,45 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
+
+    @torch.no_grad()
+    def init_kv_cache_random(
+        self,
+        kv_cache: torch.Tensor,
+        block_ranges: list[tuple[int, int]],
+        generator: torch.Generator,
+    ) -> None:
+        """Fill blocks of the indexer cache with random keys, for benchmarks.
+
+        Each block stores its tokens' keys, then their scales: FP8 keys with
+        unit fp32 scales, or MXFP4 keys with their UE8M0 scales.
+        """
+        num_blocks, rows, width = kv_cache.shape
+        if width not in (132, 68):
+            raise NotImplementedError(f"Random init of indexer cache {kv_cache.shape}")
+        values = rows * (128 if width == 132 else 64)
+        flat = kv_cache.view(num_blocks, rows * width)
+        for begin, end in block_ranges:
+            keys = torch.randn(
+                (end - begin, rows * 128), generator=generator, device=kv_cache.device
+            )
+            if width == 132:
+                flat[begin:end, :values].copy_(
+                    keys.to(torch.float8_e4m3fn).view(torch.uint8)
+                )
+                flat[begin:end, values:].view(torch.float32).fill_(1.0)
+                continue
+            from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+                mxfp4_quantize,
+            )
+
+            quant, scales = mxfp4_quantize(keys.reshape(-1, 128).bfloat16())
+            flat[begin:end, :values].copy_(
+                quant.view(torch.uint8).view(end - begin, -1)
+            )
+            flat[begin:end, values:].copy_(
+                scales.view(torch.uint8).view(end - begin, -1)
+            )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # head_dim already carries the fp8 scale padding

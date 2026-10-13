@@ -741,6 +741,8 @@ class DeepseekV4MoE(nn.Module):
         self.hash_indices_dtype = (
             torch.int64 if self.use_native_mega_moe else torch.int32
         )
+        # Fixed (topk_weights, topk_ids) for benchmarks; see set_routing_override.
+        self.routing_override: tuple[torch.Tensor, torch.Tensor] | None = None
         if is_hash_moe:
             # hash MoE doesn't use e_score_correction_bias
             # Use randint instead of empty to avoid garbage values causing
@@ -973,6 +975,12 @@ class DeepseekV4MoE(nn.Module):
                 fix_routing_mask=fix_routing_mask,
                 unmapped_topk_idx=unmapped_topk_idx,
             )
+        if self.routing_override is not None:
+            weights, ids = self.routing_override
+            assert ids.dtype == topk_ids.dtype, (ids.dtype, topk_ids.dtype)
+            assert weights.dtype == topk_weights.dtype, topk_weights.dtype
+            num_tokens = hidden_states.shape[0]
+            topk_weights, topk_ids = weights[:num_tokens], ids[:num_tokens]
         activation_clamp = (
             float(self.swiglu_limit) if self.swiglu_limit is not None else None
         )
@@ -991,6 +999,25 @@ class DeepseekV4MoE(nn.Module):
             final_hidden_states += shared_output
 
         return final_hidden_states.view(org_shape)
+
+    def set_routing_override(self, topk_ids: torch.Tensor | None) -> None:
+        """Route tokens to fixed experts, for benchmarks.
+
+        The gate still runs; its routing is replaced by `topk_ids`
+        ([max_num_tokens, top_k] logical expert IDs) with uniform weights.
+        """
+        if topk_ids is None:
+            self.routing_override = None
+            return
+        if not self.use_native_mega_moe:
+            raise NotImplementedError("Routing override requires MegaMoE.")
+        weights = torch.full(
+            topk_ids.shape,
+            self.routed_scaling_factor / self.n_activated_experts,
+            dtype=torch.float32,
+            device=topk_ids.device,
+        )
+        self.routing_override = (weights, topk_ids.to(self.hash_indices_dtype))
 
     def _forward_fused_moe(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
