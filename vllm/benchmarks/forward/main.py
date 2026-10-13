@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Benchmark the model forward of exact batches as one-shot CUDA graphs.
 
-Each case is a list of requests `(query_len, context_len, num_draft_tokens)`
+Each case is a list of requests `(query_len, kv_len, num_draft_tokens)`
 per DP rank. The bench builds the batch without the scheduler, runs it through
 the real `execute_model` (input prep, attention metadata, DP sync), and times
 the target-model forward captured as a CUDA graph. Sampling, the speculator
@@ -36,10 +36,10 @@ def add_cli_args(parser: FlexibleArgumentParser) -> None:
         "--case",
         action="append",
         default=[],
-        help="NAME=REQS, where REQS is a comma list of [N*]Q@C[h][:D] (query "
-        "length Q, context length C, D draft tokens, N requests; h = prefill "
-        "after a prefix hit). E.g. decode=32*1@8192, verify=16*4@4096:3, "
-        "hit=8192@32768h, mix=8192@0,32*1@8192. Repeatable.",
+        help="NAME=REQS, where REQS is a comma list of [N*]Q[@K][h][:D] (query "
+        "length Q, KV length K including the query (default Q), D draft tokens, "
+        "N requests; h = prefill after a prefix hit). E.g. decode=32*1@8192, "
+        "verify=16*4@4096:3, prefill=8192, mix=8192,32*1@8192. Repeatable.",
     )
     parser.add_argument("--shapes", help="JSON or YAML file with cases.")
     parser.add_argument(
@@ -127,7 +127,7 @@ def _make_engine_args(args: argparse.Namespace, cases: list[BenchCase]):
             ),
         )
     if engine_args.max_model_len is None:
-        engine_args.max_model_len = max(c.max_seq_len for c in cases)
+        engine_args.max_model_len = max(c.max_kv_len for c in cases)
     return engine_args
 
 

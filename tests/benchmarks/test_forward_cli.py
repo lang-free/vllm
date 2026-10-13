@@ -23,7 +23,7 @@ def _group(block_size: int, replay: int = 0):
 
 def test_build_batch_layout():
     """The runner sees each request kind as the scheduler would schedule it."""
-    case = parse_case("c=2*1@100,4@60:3,32@0,8@40,16@300h")
+    case = parse_case("c=2*1@101,4@64:3,32,8@48,16@316h")
     groups = [_group(16), _group(32, replay=128)]
     batch = build_batch(case, groups, 1000, 1000, np.random.default_rng(0))
 
@@ -68,7 +68,7 @@ def test_bench_forward(tmp_path):
         "--case",
         "decode=8*1@512",
         "--case",
-        "prefill=256@0",
+        "prefill=256",
         "--case",
         "mix=128@256,4*1@512",
         "--iters",

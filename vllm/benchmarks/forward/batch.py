@@ -44,18 +44,18 @@ class BenchBatch:
         return output
 
 
-def _num_blocks(spec: KVCacheSpec, context_len: int, seq_len: int) -> tuple[int, int]:
+def _num_blocks(spec: KVCacheSpec, computed: int, kv_len: int) -> tuple[int, int]:
     """Return (leading null blocks, live blocks) for one request."""
     if isinstance(spec, UniformTypeKVCacheSpecs):
         spec = spec.first_spec
     if isinstance(spec, (CircularBufferSpec, MambaSpec)):
         return 0, 1
     block_size = spec.block_size
-    total = -(-seq_len // block_size)
+    total = -(-kv_len // block_size)
     skipped = 0
     if isinstance(spec, SlidingWindowSpec):
         # Blocks wholly before the window are freed to the null block.
-        skipped = max(0, context_len - spec.sliding_window + 1) // block_size
+        skipped = max(0, computed - spec.sliding_window + 1) // block_size
     return skipped, total - skipped
 
 
@@ -71,15 +71,17 @@ def build_batch(
     Groups share one block pool, so block IDs are unique across groups. Block
     0 is the null block.
 
+    With prefix P = K - Q (KV length K, query length Q):
+
     | Kind               | prompt tokens | num_computed_tokens | spec tokens |
     | ------------------ | ------------- | ------------------- | ----------- |
-    | Prefill (chunked)  | C + Q         | C                   | -           |
-    | Decode             | C             | C                   | -           |
-    | Verify (D drafts)  | C             | C                   | D           |
+    | Prefill (chunked)  | K             | P                   | -           |
+    | Decode             | P             | P                   | -           |
+    | Verify (D drafts)  | P             | P                   | D           |
 
-    A prefix hit replays the hit's last R = min(window, C) tokens on models
+    A prefix hit replays the hit's last R = min(window, P) tokens on models
     with SWA bounded replay (window 0 otherwise), like the scheduler: it
-    schedules R + Q tokens from replay_start = num_computed_tokens = C - R.
+    schedules R + Q tokens from replay_start = num_computed_tokens = P - R.
     """
     replay_window = max(
         (group.kv_cache_spec.prefix_replay_tokens for group in kv_cache_groups),
@@ -93,16 +95,16 @@ def build_batch(
     output = SchedulerOutput.make_empty()
     for i, req in enumerate(case.requests):
         req_id = f"bench-{i}"
-        replay = min(replay_window, req.context_len) if req.prefix_hit else 0
-        computed = req.context_len - replay
+        replay = min(replay_window, req.prefix_len) if req.prefix_hit else 0
+        computed = req.prefix_len - replay
         block_ids = []
         for group, ranges in zip(kv_cache_groups, group_block_ranges):
-            skipped, live = _num_blocks(group.kv_cache_spec, computed, req.seq_len)
+            skipped, live = _num_blocks(group.kv_cache_spec, computed, req.kv_len)
             block_ids.append([0] * skipped + list(range(cursor, cursor + live)))
             ranges.append((cursor, cursor + live))
             cursor += live
-        tokens = rng.integers(0, vocab_size, req.seq_len, dtype=np.int64)
-        prompt = tokens[: req.context_len] if req.is_decode else tokens
+        tokens = rng.integers(0, vocab_size, req.kv_len, dtype=np.int64)
+        prompt = tokens[: req.prefix_len] if req.is_decode else tokens
         query_token_ids[req_id] = tokens[computed:]
         expected[req_id] = (req.query_len + replay, computed, req.is_decode)
         new_reqs.append(
@@ -122,7 +124,7 @@ def build_batch(
         output.num_scheduled_tokens[req_id] = req.query_len + replay
         if req.num_draft_tokens:
             output.scheduled_spec_decode_tokens[req_id] = tokens[
-                req.context_len + 1 :
+                req.prefix_len + 1 :
             ].tolist()
     if cursor > num_kv_blocks:
         raise ValueError(
