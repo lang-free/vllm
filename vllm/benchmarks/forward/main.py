@@ -23,7 +23,12 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm.benchmarks.forward.shapes import BenchCase, load_cases, parse_case
+from vllm.benchmarks.forward.shapes import (
+    BenchCase,
+    jitter_kv_lens,
+    load_cases,
+    parse_case,
+)
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -42,6 +47,15 @@ def add_cli_args(parser: FlexibleArgumentParser) -> None:
         "verify=16*4@4096:3, prefill=8192, mix=8192,32*1@8192. Repeatable.",
     )
     parser.add_argument("--shapes", help="JSON or YAML file with cases.")
+    parser.add_argument(
+        "--kv-len-jitter",
+        type=float,
+        default=0.5,
+        help="Draw each request's prefix (KV length minus query length) "
+        "uniformly within +-this fraction of its value, like the varied lengths "
+        "of a real batch, capped at the max model length. Seeded by --seed only, "
+        "so every DP rank gets the same lengths. 0 keeps the exact lengths.",
+    )
     parser.add_argument(
         "--kv-init",
         choices=["random", "zeros"],
@@ -126,8 +140,6 @@ def _make_engine_args(args: argparse.Namespace, cases: list[BenchCase]):
                 for c in cases
             ),
         )
-    if engine_args.max_model_len is None:
-        engine_args.max_model_len = max(c.max_kv_len for c in cases)
     return engine_args
 
 
@@ -195,6 +207,8 @@ def main(args: argparse.Namespace) -> None:
         cases += load_cases(args.shapes)
     if not cases:
         raise ValueError("Pass at least one --case or --shapes.")
+    if not 0 <= args.kv_len_jitter < 1:
+        raise ValueError("--kv-len-jitter must be in [0, 1).")
     _setup_env()
 
     from vllm import LLM
@@ -203,6 +217,10 @@ def main(args: argparse.Namespace) -> None:
 
     llm = LLM.from_engine_args(_make_engine_args(args, cases))
     runner = llm.llm_engine.model_executor.driver_worker.worker.model_runner
+    # Same draw on every rank: shapes are balanced across DP ranks.
+    rng = np.random.default_rng(args.seed)
+    max_kv_len = runner.model_config.max_model_len
+    cases = [jitter_kv_lens(c, args.kv_len_jitter, max_kv_len, rng) for c in cases]
     world = get_world_group()
     results = []
     with torch.inference_mode(), set_current_vllm_config(runner.vllm_config):

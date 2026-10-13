@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from vllm.benchmarks.forward.batch import build_batch
-from vllm.benchmarks.forward.shapes import parse_case
+from vllm.benchmarks.forward.shapes import jitter_kv_lens, parse_case
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
 
@@ -50,6 +50,22 @@ def test_build_batch_layout():
 
     with pytest.raises(ValueError, match="KV blocks"):
         build_batch(case, groups, 10, 1000, np.random.default_rng(0))
+
+
+def test_jitter_kv_lens():
+    """Prefixes vary, capped at the max length; queries and fresh prefills don't."""
+    case = parse_case("c=1000*1@1001,4@64:3,32")
+    jittered = jitter_kv_lens(case, 0.5, 1400, np.random.default_rng(0))
+    prefixes = np.array([r.prefix_len for r in jittered.requests[:1000]])
+    assert prefixes.min() >= 500 and max(r.kv_len for r in jittered.requests) == 1400
+    assert prefixes.std() > 200
+    assert [r.query_len for r in jittered.requests] == [
+        r.query_len for r in case.requests
+    ]
+    assert jittered.requests[-1] == case.requests[-1]
+    assert jitter_kv_lens(case, 0, 2048, np.random.default_rng(0)) == case
+    with pytest.raises(ValueError, match="KV length"):
+        jitter_kv_lens(case, 0, 1000, np.random.default_rng(0))
 
 
 @pytest.mark.benchmark

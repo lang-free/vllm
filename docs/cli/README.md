@@ -136,7 +136,7 @@ vllm bench {forward, latency, serve, throughput}
 
 ### forward
 
-Benchmark the model forward of exact batches: each case lists its requests as `[N*]Q[@K][h][:D]` (query length Q, KV length K including the query, D draft tokens, `h` for a prefill after a prefix hit). Each forward is captured as a one-shot CUDA graph; sampling and CPU overhead aren't measured. Use `torchrun`, one process per GPU, for DP/TP/EP.
+Benchmark the model forward of exact batches: each case lists its requests as `[N*]Q[@K][h][:D]` (query length Q, KV length K including the query, D draft tokens, `h` for a prefill after a prefix hit). Each request's prefix length varies by ±50% by default (`--kv-len-jitter`), identically on every DP rank. Each forward is captured as a one-shot CUDA graph; sampling and CPU overhead aren't measured. Use `torchrun`, one process per GPU, for DP/TP/EP.
 
 ```bash
 vllm bench forward \

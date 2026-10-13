@@ -3,9 +3,10 @@
 """Exact batch shapes for `vllm bench forward`."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+import numpy as np
 import regex as re
 
 
@@ -54,9 +55,25 @@ class BenchCase:
     def num_tokens(self) -> int:
         return sum(r.query_len for r in self.requests)
 
-    @property
-    def max_kv_len(self) -> int:
-        return max(r.kv_len for r in self.requests)
+
+def jitter_kv_lens(
+    case: BenchCase, jitter: float, max_kv_len: int, rng: np.random.Generator
+) -> BenchCase:
+    """Draw each request's prefix uniformly within +-jitter of its value.
+
+    Query lengths are kept, so a fresh prefill stays one and a non-empty
+    prefix stays non-empty. KV lengths are capped at `max_kv_len`.
+    """
+    requests = []
+    for req in case.requests:
+        if req.kv_len > max_kv_len:
+            raise ValueError(f"{case.name}: KV length {req.kv_len} > {max_kv_len}")
+        prefix = req.prefix_len
+        if prefix and jitter:
+            prefix = max(1, round(prefix * rng.uniform(1 - jitter, 1 + jitter)))
+        kv_len = min(req.query_len + prefix, max_kv_len)
+        requests.append(replace(req, kv_len=kv_len))
+    return replace(case, requests=tuple(requests))
 
 
 _REQ_RE = re.compile(r"^(?:(\d+)\*)?(\d+)(?:@(\d+))?(h)?(?::(\d+))?$")
